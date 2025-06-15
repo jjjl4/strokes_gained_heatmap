@@ -1,14 +1,17 @@
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+import matplotlib.cm as cm
 import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 from shapely.affinity import rotate
-from matplotlib.colors import BoundaryNorm
 from pathlib import Path
 
 DATA_PATH = Path('/workspaces/strokes_gained/data')
 FIGURE_PATH = Path('/workspaces/strokes_gained/figs')
+
 LIE_MAPPING = {
     'green': 'Green',
     'fairway': 'Fairway',
@@ -47,7 +50,41 @@ def get_zones(hole_gdf):
     return zones
 
 
-def generate_sg_grid(hole_gdf, sg_df, sg_step, res):
+def rotate_hole(hole_gdf):
+    tee = hole_gdf[hole_gdf['course_element']
+                   == 'tee'].geometry.union_all().centroid
+    green = hole_gdf[hole_gdf['course_element']
+                     == 'green'].geometry.union_all().centroid
+    angle = -np.degrees(np.arctan2(green.y - tee.y, green.x - tee.x)) + 90
+    hole_gdf = hole_gdf.copy()
+    hole_gdf['geometry'] = hole_gdf.geometry.apply(
+        lambda geom: rotate(geom, angle, origin=tee))
+    return hole_gdf
+
+
+def plot_course_elements(ax, hole_gdf):
+    face_colours = hole_gdf['color'].fillna('#cccccc')
+    hole_gdf.plot(ax=ax, facecolor=face_colours,
+                  edgecolor='black', linewidth=0.5, alpha=0.6)
+    return get_zones(hole_gdf)
+
+
+def get_custom_viridis_with_adjusted_integers(vmin, vmax, adjust_factor=0.5, mode='lighten', n_continuous=256):
+    base = plt.get_cmap('viridis')
+    continuous = base(np.linspace(0, 1, n_continuous))
+    for val in range(int(vmin), int(vmax) + 1):
+        idx = int((val - vmin) / (vmax - vmin) * (n_continuous - 1))
+        rgb = continuous[idx, :3]
+        adjusted = rgb + \
+            (1 - rgb) * adjust_factor if mode == 'lighten' else rgb * \
+            (1 - adjust_factor)
+        continuous[idx, :3] = np.clip(adjusted, 0, 1)
+    cmap = ListedColormap(continuous)
+    norm = BoundaryNorm(np.linspace(vmin, vmax, n_continuous), ncolors=cmap.N)
+    return cmap, norm
+
+
+def generate_sg_grid_filtered(hole_gdf, sg_df, sg_step, res):
     minx, miny, maxx, maxy = hole_gdf.total_bounds
     aspect = (maxy - miny) / (maxx - minx)
     x_coords = np.linspace(minx, maxx, res)
@@ -56,24 +93,22 @@ def generate_sg_grid(hole_gdf, sg_df, sg_step, res):
                             for y in y_coords for x in x_coords], crs=None)
 
     zones = get_zones(hole_gdf)
-    green_poly = hole_gdf[hole_gdf['course_element']
-                          == 'green'].geometry.union_all()
-    hole_point = green_poly.centroid
-    if hole_point.is_empty or not hole_point.is_valid:
+    if not zones:
         return None
+    green_poly = zones.get('Green')
+    if green_poly is None or green_poly.is_empty:
+        return None
+    hole_point = green_poly.centroid
 
     grid['lie'] = grid['geometry'].apply(lambda pt: next(
-        (lie for lie, poly in zones.items() if poly.contains(pt)), None))
+        (lie for lie, poly in zones.items() if poly.contains(pt) and lie in sg_df.columns), None))
+    grid = grid[grid['lie'].notna()]
+    if grid.empty:
+        return None
+
     grid['dist'] = grid.geometry.distance(hole_point) / 0.9144
-
-    def expected_strokes(row):
-        if pd.isna(row['dist']) or pd.isna(row['lie']):
-            return np.nan
-        d = int(round(row['dist']))
-        l = row['lie']
-        return sg_df.at[d, l] if d in sg_df.index and l in sg_df.columns else np.nan
-
-    grid['expected'] = grid.apply(expected_strokes, axis=1)
+    grid['expected'] = grid.apply(lambda r: sg_df.at[int(round(r['dist'])), r['lie']] if int(
+        round(r['dist'])) in sg_df.index else np.nan, axis=1)
     grid = grid.dropna(subset=['expected'])
     if grid.empty:
         return None
@@ -85,61 +120,29 @@ def generate_sg_grid(hole_gdf, sg_df, sg_step, res):
     return grid, norm
 
 
-def rotate_hole(hole_gdf):
-    tee_centroid = hole_gdf[hole_gdf['course_element']
-                            == 'tee'].geometry.union_all().centroid
-    green_centroid = hole_gdf[hole_gdf['course_element']
-                              == 'green'].geometry.union_all().centroid
-    dx, dy = green_centroid.x - tee_centroid.x, green_centroid.y - tee_centroid.y
-    angle = -np.degrees(np.arctan2(dy, dx)) + 90
-    hole_gdf = hole_gdf.copy()
-    hole_gdf['geometry'] = hole_gdf.geometry.apply(
-        lambda geom: rotate(geom, angle, origin=tee_centroid))
-    return hole_gdf
+def plot_sg_overlay(ax, grid, sg_step, adjust_factor=0.5, mode='lighten'):
+    vmin_global, vmax_global = 1, 6
+    vmax_local = np.ceil(grid['expected'].max())
+
+    cmap, _ = get_custom_viridis_with_adjusted_integers(
+        vmin_global, vmax_global, adjust_factor, mode)
+    norm = plt.Normalize(vmin_global, vmax_global)
+
+    grid.plot(ax=ax, column='expected', cmap=cmap,
+              markersize=1, alpha=0.5, norm=norm)
+
+    sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+
+    cbar = plt.colorbar(sm, ax=ax)
+    cbar.set_label('Expected Strokes')
+    # show integers only
+    cbar.set_ticks(np.arange(vmin_global, vmax_local + 1))
+    cbar.ax.invert_yaxis()
+    # limit display to [1, local_max]
+    cbar.ax.set_ylim(vmax_local, vmin_global)
 
 
-def plot_course_elements(ax, hole_gdf):
-    face_colours = hole_gdf['color'].fillna('#cccccc')
-    hole_gdf.plot(ax=ax, facecolor=face_colours,
-                  edgecolor='black', linewidth=0.5, alpha=0.6)
-
-
-def plot_full_course(course='erin_hills', plot_sg=False, sg_step=0.1, res=300, gdf=None):
-    if gdf is None:
-        gdf = get_get_gdf()
-    gdf = preprocess_gdf(gdf, course)
-    sg_df = get_sg_df() if plot_sg else None
-
-    minx, miny, maxx, maxy = gdf.total_bounds
-    aspect = (maxy - miny) / (maxx - minx)
-
-    fig, ax = plt.subplots(figsize=(12, 12 * aspect))
-    plot_course_elements(ax, gdf)
-
-    if plot_sg and sg_df is not None:
-        for hole in sorted(gdf['hole_num'].unique(), key=int):
-            hole_gdf = gdf[gdf['hole_num'] == hole]
-            result = generate_sg_grid(hole_gdf, sg_df, sg_step, res)
-            if result:
-                grid, norm = result
-                grid.plot(ax=ax, column='expected', cmap='viridis',
-                          markersize=1, alpha=0.5, norm=norm)
-
-    ax.set_title("Full Course Layout" +
-                 (" with Strokes Gained Overlay" if plot_sg else ""))
-    ax.axis("off")
-    ax.set_aspect('equal')
-    plt.tight_layout()
-
-    save_dir = FIGURE_PATH / course
-    save_dir.mkdir(parents=True, exist_ok=True)
-    sg_flag = "sg_true" if plot_sg else "sg_false"
-    filename = f"course_layout_{sg_flag}_step_{sg_step}.png" if plot_sg else f"course_layout_{sg_flag}.png"
-    plt.savefig(save_dir / filename, dpi=300)
-    plt.close()
-
-
-def plot_single_hole(hole, course='erin_hills', plot_sg=False, sg_step=0.1, res=300, gdf=None):
+def plot_single_hole(hole, course='erin_hills', plot_sg=False, sg_step=0.1, res=300, gdf=None, adjust_factor=0.5, mode='lighten', show=True):
     if gdf is None:
         gdf = get_get_gdf()
     gdf = preprocess_gdf(gdf, course)
@@ -154,18 +157,65 @@ def plot_single_hole(hole, course='erin_hills', plot_sg=False, sg_step=0.1, res=
     hole_gdf = rotate_hole(hole_gdf)
     minx, miny, maxx, maxy = hole_gdf.total_bounds
     aspect = (maxy - miny) / (maxx - minx)
-
     fig, ax = plt.subplots(figsize=(6, 6 * aspect))
+
     plot_course_elements(ax, hole_gdf)
 
     if plot_sg and sg_df is not None:
-        result = generate_sg_grid(hole_gdf, sg_df, sg_step, res)
+        result = generate_sg_grid_filtered(hole_gdf, sg_df, sg_step, res)
         if result:
-            grid, norm = result
-            grid.plot(ax=ax, column='expected', cmap='viridis',
-                      markersize=1, alpha=0.5, norm=norm)
+            grid, _ = result
+            plot_sg_overlay(ax, grid, sg_step, adjust_factor, mode)
 
-    ax.set_title(f"{course.replace('_', ' ').title()} – Hole {hole}")
+    ax.set_title(f"{course.replace('_',' ').title()} – Hole {hole}")
+    ax.axis("off")
+    ax.set_aspect('equal')
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+    else:
+        save_dir = FIGURE_PATH / course
+        save_dir.mkdir(parents=True, exist_ok=True)
+        sg_flag = "sg_true" if plot_sg else "sg_false"
+        filename = f"hole_{hole}_{sg_flag}_step_{sg_step}.png"
+        plt.savefig(save_dir / filename, dpi=300)
+        plt.close()
+
+
+def plot_full_course(course='erin_hills', plot_sg=False, sg_step=0.1, res=300, gdf=None, adjust_factor=0.5, mode='lighten'):
+    if gdf is None:
+        gdf = get_get_gdf()
+    gdf = preprocess_gdf(gdf, course)
+    sg_df = get_sg_df() if plot_sg else None
+
+    minx, miny, maxx, maxy = gdf.total_bounds
+    aspect = (maxy - miny) / (maxx - minx)
+    fig, ax = plt.subplots(figsize=(12, 12 * aspect))
+    plot_course_elements(ax, gdf)
+
+    if plot_sg and sg_df is not None:
+        vmin_global, vmax_global = 1, 7
+        cmap, _ = get_custom_viridis_with_adjusted_integers(
+            vmin_global, vmax_global, adjust_factor, mode)
+        norm = plt.Normalize(vmin_global, vmax_global)
+
+        for hole in sorted(gdf['hole_num'].unique(), key=int):
+            hole_gdf = gdf[gdf['hole_num'] == hole]
+            result = generate_sg_grid_filtered(hole_gdf, sg_df, sg_step, res)
+            if result:
+                grid, _ = result
+                grid.plot(ax=ax, column='expected', cmap=cmap,
+                          markersize=1, alpha=0.5, norm=norm)
+
+        sm = cm.ScalarMappable(cmap=cmap, norm=norm)
+        cbar = plt.colorbar(sm, ax=ax)
+        cbar.set_label('Expected Strokes')
+        cbar.set_ticks(np.arange(vmin_global, vmax_global + 1))
+        cbar.ax.invert_yaxis()
+
+    ax.set_title("Full Course Layout" +
+                 (" with Strokes Gained Overlay" if plot_sg else ""))
     ax.axis("off")
     ax.set_aspect('equal')
     plt.tight_layout()
@@ -173,12 +223,12 @@ def plot_single_hole(hole, course='erin_hills', plot_sg=False, sg_step=0.1, res=
     save_dir = FIGURE_PATH / course
     save_dir.mkdir(parents=True, exist_ok=True)
     sg_flag = "sg_true" if plot_sg else "sg_false"
-    filename = f"hole_{hole}_{sg_flag}_step_{sg_step}.png" if plot_sg else f"hole_{hole}_{sg_flag}.png"
+    filename = f"course_layout_{sg_flag}_step_{sg_step}.png"
     plt.savefig(save_dir / filename, dpi=300)
     plt.close()
 
 
-def plot_course_subplots(course='erin_hills', plot_sg=False, sg_step=0.1, res=300, gdf=None):
+def plot_course_subplots(course='erin_hills', plot_sg=False, sg_step=0.1, res=300, gdf=None, adjust_factor=0.5, mode='lighten'):
     if gdf is None:
         gdf = get_get_gdf()
     gdf = preprocess_gdf(gdf, course)
@@ -199,11 +249,10 @@ def plot_course_subplots(course='erin_hills', plot_sg=False, sg_step=0.1, res=30
         plot_course_elements(ax, hole_gdf)
 
         if plot_sg and sg_df is not None:
-            result = generate_sg_grid(hole_gdf, sg_df, sg_step, res)
+            result = generate_sg_grid_filtered(hole_gdf, sg_df, sg_step, res)
             if result:
-                grid, norm = result
-                grid.plot(ax=ax, column='expected', cmap='viridis',
-                          markersize=1, alpha=0.5, norm=norm)
+                grid, _ = result
+                plot_sg_overlay(ax, grid, sg_step, adjust_factor, mode)
 
         ax.set_title(f"Hole {hole}")
         ax.axis("off")
@@ -213,10 +262,9 @@ def plot_course_subplots(course='erin_hills', plot_sg=False, sg_step=0.1, res=30
         ax.axis("off")
 
     plt.tight_layout()
-
     save_dir = FIGURE_PATH / course
     save_dir.mkdir(parents=True, exist_ok=True)
     sg_flag = "sg_true" if plot_sg else "sg_false"
-    filename = f"course_holes_{sg_flag}_step_{sg_step}.png" if plot_sg else f"course_holes_{sg_flag}.png"
+    filename = f"course_holes_{sg_flag}_step_{sg_step}.png"
     plt.savefig(save_dir / filename, dpi=300)
     plt.close()
