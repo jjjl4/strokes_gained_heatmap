@@ -9,8 +9,10 @@ from shapely.geometry import Point
 from shapely.affinity import rotate
 from pathlib import Path
 
-DATA_PATH = Path('/workspaces/strokes_gained/data')
-FIGURE_PATH = Path('/workspaces/strokes_gained/figs')
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "data"
+FIGURE_PATH = BASE_DIR / "figs"
+
 
 LIE_MAPPING = {
     'green': 'Green',
